@@ -506,7 +506,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gl"
+name = "glock"
 version = "0.1.1"
 dependencies = [
  "aes-gcm",
