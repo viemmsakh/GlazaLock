@@ -30,7 +30,7 @@ fn main() -> Result<()> {
         eprintln!("Error: Failed to initialize config table: {e}");
         std::process::exit(1);
     }
-    
+
     // Create store table if not exists
     if let Err(e) = conn.execute(
         "CREATE TABLE IF NOT EXISTS store (
@@ -45,19 +45,26 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Some(Commands::Generate { length, uppercase, numbers, symbols , word, copy}) => {
+        Some(Commands::Generate {
+            length,
+            uppercase,
+            numbers,
+            symbols,
+            word,
+            copy,
+        }) => {
             commands::generate_password(length, uppercase, numbers, symbols, word, copy);
-        },
+        }
         Some(Commands::Interactive) => {
             if let Some(master_password) = helper::handle_authentication(&conn) {
                 commands::run_interactive(&conn, &master_password);
             }
-        },
+        }
         Some(Commands::Read { key, copy }) => {
             if let Some(master_password) = helper::handle_authentication(&conn) {
                 commands::run_read(&conn, key, &master_password, copy);
             }
-        },
+        }
         None => {
             if let Some(master_password) = helper::handle_authentication(&conn) {
                 commands::run_interactive(&conn, &master_password);
@@ -66,5 +73,4 @@ fn main() -> Result<()> {
     }
 
     Ok(())
-
 }
