@@ -372,6 +372,18 @@ pub fn handle_authentication(conn: &Connection) -> Option<String> {
             }
         }
         Err(_) => {
+            let count_sql = "SELECT COUNT(*) from store";
+            let store_count: i64 = match conn.query_row(count_sql, [], |row| row.get(0)) {
+                Ok(count) => count,
+                Err(_) => 0,
+            };
+            if store_count > 0 {
+                eprintln!("[SECURITY ALERT]: Critical Integrity Violation Detected!");
+                eprintln!(
+                    "Authentication has been locked down to protect data integrity. Operation aborted."
+                );
+                return None;
+            }
             println!("--- Master Password Setup ---");
             println!("No master password detected. Please configure one now.");
 
