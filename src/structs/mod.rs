@@ -50,4 +50,6 @@ pub enum Commands {
         )]
         copy: bool,
     },
+    /// Reset master password, must know existing master password.
+    Reset,
 }

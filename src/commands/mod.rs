@@ -1,5 +1,10 @@
-use dialoguer::{FuzzySelect, Input, theme::ColorfulTheme};
-use rusqlite::{Connection, params};
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHasher, SaltString},
+};
+use dialoguer::{FuzzySelect, Input, Password, theme::ColorfulTheme};
+use rand::Rng;
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 // Import Custom Modules
 use crate::helper;
@@ -25,6 +30,128 @@ pub fn generate_password(
         helper::copy_to_clipboard(&password);
     } else {
         println!("{}", password);
+    }
+}
+
+pub fn reset_master_password(conn: &Connection, master_password: &str) {
+    let theme = ColorfulTheme::default();
+    let argon2 = Argon2::default();
+    println!("--- Reset Master Password ---");
+    let new_master_password = match Password::with_theme(&theme)
+        .with_prompt("Enter NEW Master Password")
+        .interact()
+    {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let confirm_master_password = match Password::with_theme(&theme)
+        .with_prompt("Confirm NEW Master Password")
+        .interact()
+    {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    if new_master_password == master_password {
+        eprintln!("[ERROR]: New password cannot be identical to your current password.");
+        return;
+    }
+
+    if new_master_password != confirm_master_password {
+        eprintln!("[ERROR]: Passwords do not match. Reset aborted.");
+        return;
+    }
+
+    println!("Re-encrypting database vault secrets... Do not close the application.");
+
+    let tx = match Transaction::new_unchecked(conn, TransactionBehavior::Deferred) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[Error]: Failed to open transaction frame: {}", e);
+            return;
+        }
+    };
+    let sql = "SELECT * FROM store";
+    let mut select = match tx.prepare(sql) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("[ERROR]: Failed to prepare data scanning operation.");
+            return;
+        }
+    };
+
+    let rows = match select.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    }) {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("[ERROR]: Failed to query storage elements.");
+            return;
+        }
+    };
+    let mut migrated_entries = Vec::new();
+
+    for row in rows {
+        if let Ok((key, nonce, encrypted_value)) = row {
+            let decrypted_password =
+                match helper::decrypt(&key, &encrypted_value, &nonce, master_password) {
+                    Some(decrypted) => decrypted,
+                    None => {
+                        println!("[ERROR]: Decryption failed. Corrupted block or cipher mismatch.");
+                        return;
+                    }
+                };
+            // Some((nonce_bytes.to_vec(), encrypted_value))
+            let (new_nonce, encrypted_password) =
+                match helper::encrypt(&key, &decrypted_password, &new_master_password) {
+                    Some(pair) => pair,
+                    None => {
+                        return;
+                    }
+                };
+
+            migrated_entries.push((key, new_nonce, encrypted_password));
+        }
+    }
+    drop(select);
+    for (key, nonce, encrypted_password) in migrated_entries {
+        let sql = "UPDATE store SET nonce = ?1, encrypted_value = ?2 WHERE key = ?3";
+        if tx
+            .execute(sql, params![nonce, encrypted_password, key])
+            .is_err()
+        {
+            eprintln!("[CRITICAL]: Failed to save re-encrypted record block. Aborting.");
+            return;
+        }
+    }
+    let mut salt_bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut salt_bytes);
+    let salt = match SaltString::encode_b64(&salt_bytes) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let password_hash = match argon2.hash_password(new_master_password.as_bytes(), &salt) {
+        Ok(h) => h.to_string(),
+        Err(_) => return,
+    };
+
+    let hash_sql = "UPDATE config SET password_hash = ?1 WHERE id = 1";
+    if tx.execute(hash_sql, params![password_hash]).is_err() {
+        eprintln!("[CRITICAL]: Failed to update system configuration keys. Aborting transaction.");
+        return;
+    }
+
+    match tx.commit() {
+        Ok(_) => println!("[SUCCESS]: Master password updated."),
+        Err(e) => eprintln!(
+            "[ERROR]: Failed to write updates permently to disk safely: {}",
+            e
+        ),
     }
 }
 

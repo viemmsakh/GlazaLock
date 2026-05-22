@@ -65,6 +65,11 @@ fn main() -> Result<()> {
                 commands::run_read(&conn, key, &master_password, copy);
             }
         }
+        Some(Commands::Reset) => {
+            if let Some(master_password) = helper::handle_authentication(&conn) {
+                commands::reset_master_password(&conn, &master_password);
+            }
+        }
         None => {
             if let Some(master_password) = helper::handle_authentication(&conn) {
                 commands::run_interactive(&conn, &master_password);

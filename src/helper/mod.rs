@@ -148,7 +148,7 @@ fn derive_key(key: &str, password: &str) -> Option<[u8; 32]> {
     Some(key_bytes)
 }
 
-fn encrypt(key: &str, value: &str, password: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+pub fn encrypt(key: &str, value: &str, password: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     let key_bytes = derive_key(key, password)?;
     let cipher = Aes256Gcm::new_from_slice(&key_bytes).ok()?;
     let mut nonce_bytes = [0u8; 12];
