@@ -7,7 +7,7 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use clipboard::{ClipboardContext, ClipboardProvider};
-use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
+use dialoguer::{Confirm, FuzzySelect, Input, Password, theme::ColorfulTheme};
 use homedir::my_home;
 use rand::{Rng, RngExt};
 use rusqlite::{Connection, params};
@@ -302,7 +302,10 @@ pub fn get_all_keys(conn: &Connection) -> Vec<String> {
         Err(_) => return Vec::new(),
     };
 
-    key_iterator.filter_map(|key| key.ok()).collect()
+    key_iterator
+        .filter_map(|key| key.ok())
+        .map(|key_str| format!("\t{}", key_str))
+        .collect()
 }
 
 pub fn get_db_path() -> Result<PathBuf> {
@@ -415,9 +418,9 @@ pub fn handle_authentication(conn: &Connection) -> Option<String> {
 
 pub fn manage_existing_key(conn: &Connection, key: &str, master_password: &str) {
     let theme = ColorfulTheme::default();
-    let actions = vec!["View Value", "Edit Value", "Delete Key", "Back"];
+    let actions = vec!["View", "Edit", "Copy", "Delete", "Back"];
 
-    let selection = match Select::with_theme(&theme)
+    let selection = match FuzzySelect::with_theme(&theme)
         .with_prompt(format!("Managing key: {key}"))
         .items(&actions)
         .default(0)
@@ -483,6 +486,35 @@ pub fn manage_existing_key(conn: &Connection, key: &str, master_password: &str) 
             std::process::exit(0);
         }
         2 => {
+            // Copy
+            let sql = "SELECT nonce, encrypted_value FROM store WHERE key = ?1";
+            let mut select = match conn.prepare(sql) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("[Error]: Database system failure: {e}");
+                    return;
+                }
+            };
+
+            let result = select.query_row(params![key], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            });
+
+            match result {
+                Ok((nonce, encrypted)) => {
+                    if let Some(decrypted) = decrypt(key, &encrypted, &nonce, master_password) {
+                        copy_to_clipboard(&decrypted);
+                    } else {
+                        println!(
+                            "[Error]: Decryption failed. Possible causes: Incorrect master password or data corruption."
+                        );
+                    }
+                }
+                Err(e) => println!("[Error]: Failed to retrieve key data: {e}"),
+            }
+            std::process::exit(0);
+        }
+        3 => {
             // Delete
             let confirm = Confirm::with_theme(&theme)
                 .with_prompt(format!("Are you sure you want to delete '{key}'?"))
