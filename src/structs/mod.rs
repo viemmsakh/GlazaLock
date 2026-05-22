@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(author, name = "GlazaLock", about = "A secure local key-value store for passwords.", long_about = None)]
+#[command(author, version, name = "GlazaLock", about = "A secure local key-value store for passwords.", long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,

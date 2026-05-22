@@ -1,7 +1,7 @@
 [package]
 name = "glock"
 authors = ["Aaron Glaza <akglaza@gmail.com>"]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [dependencies]
