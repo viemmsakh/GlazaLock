@@ -8,6 +8,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 // Import Custom Modules
 use crate::helper;
+use crate::structs::PRINTSTATUS;
 
 pub fn generate_password(
     length: usize,
@@ -18,7 +19,10 @@ pub fn generate_password(
     copy: bool,
 ) {
     if length < 8 {
-        println!("[Warning]: Password requested less than 8 characters.... Not secure, giving up.");
+        helper::print_message(
+            PRINTSTATUS::ERROR,
+            format!("Password requested less than 8 characters.... Not secure, giving up."),
+        );
         std::process::exit(1);
     }
     let password = if word {
@@ -29,14 +33,14 @@ pub fn generate_password(
     if copy {
         helper::copy_to_clipboard(&password);
     } else {
-        println!("{}", password);
+        helper::print_message(PRINTSTATUS::SUCCESS, format!("{}", password));
     }
 }
 
 pub fn reset_master_password(conn: &Connection, master_password: &str) {
     let theme = ColorfulTheme::default();
     let argon2 = Argon2::default();
-    println!("--- Reset Master Password ---");
+    helper::print_message(PRINTSTATUS::INFO, format!("--- Reset Master Password ---"));
     let new_master_password = match Password::with_theme(&theme)
         .with_prompt("Enter NEW Master Password")
         .interact()
@@ -53,21 +57,33 @@ pub fn reset_master_password(conn: &Connection, master_password: &str) {
     };
 
     if new_master_password == master_password {
-        eprintln!("[ERROR]: New password cannot be identical to your current password.");
+        helper::print_message(
+            PRINTSTATUS::ERROR,
+            format!("New password cannot be identical to your current password."),
+        );
         return;
     }
 
     if new_master_password != confirm_master_password {
-        eprintln!("[ERROR]: Passwords do not match. Reset aborted.");
+        helper::print_message(
+            PRINTSTATUS::ERROR,
+            format!("Passwords do not match. Reset aborted."),
+        );
         return;
     }
 
-    println!("Re-encrypting database vault secrets... Do not close the application.");
+    helper::print_message(
+        PRINTSTATUS::SUCCESS,
+        format!("Re-encrypting database vault secrets... Do not close the application."),
+    );
 
     let tx = match Transaction::new_unchecked(conn, TransactionBehavior::Deferred) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("[Error]: Failed to open transaction frame: {}", e);
+            helper::print_message(
+                PRINTSTATUS::ERROR,
+                format!("Failed to open transaction frame: {}", e),
+            );
             return;
         }
     };
@@ -75,7 +91,10 @@ pub fn reset_master_password(conn: &Connection, master_password: &str) {
     let mut select = match tx.prepare(sql) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("[ERROR]: Failed to prepare data scanning operation.");
+            helper::print_message(
+                PRINTSTATUS::ERROR,
+                format!("Failed to prepare data scanning operation."),
+            );
             return;
         }
     };
@@ -89,7 +108,10 @@ pub fn reset_master_password(conn: &Connection, master_password: &str) {
     }) {
         Ok(r) => r,
         Err(_) => {
-            eprintln!("[ERROR]: Failed to query storage elements.");
+            helper::print_message(
+                PRINTSTATUS::ERROR,
+                format!("Failed to query storage elements."),
+            );
             return;
         }
     };
@@ -101,7 +123,10 @@ pub fn reset_master_password(conn: &Connection, master_password: &str) {
                 match helper::decrypt(&key, &encrypted_value, &nonce, master_password) {
                     Some(decrypted) => decrypted,
                     None => {
-                        println!("[ERROR]: Decryption failed. Corrupted block or cipher mismatch.");
+                        helper::print_message(
+                            PRINTSTATUS::ERROR,
+                            format!("Decryption failed. Corrupted block or cipher mismatch."),
+                        );
                         return;
                     }
                 };
@@ -124,7 +149,10 @@ pub fn reset_master_password(conn: &Connection, master_password: &str) {
             .execute(sql, params![nonce, encrypted_password, key])
             .is_err()
         {
-            eprintln!("[CRITICAL]: Failed to save re-encrypted record block. Aborting.");
+            helper::print_message(
+                PRINTSTATUS::ERROR,
+                format!("Failed to save re-encrypted record block. Aborting."),
+            );
             return;
         }
     }
@@ -142,15 +170,18 @@ pub fn reset_master_password(conn: &Connection, master_password: &str) {
 
     let hash_sql = "UPDATE config SET password_hash = ?1 WHERE id = 1";
     if tx.execute(hash_sql, params![password_hash]).is_err() {
-        eprintln!("[CRITICAL]: Failed to update system configuration keys. Aborting transaction.");
+        helper::print_message(
+            PRINTSTATUS::ERROR,
+            format!("Failed to update system configuration keys. Aborting transaction."),
+        );
         return;
     }
 
     match tx.commit() {
-        Ok(_) => println!("[SUCCESS]: Master password updated."),
-        Err(e) => eprintln!(
-            "[ERROR]: Failed to write updates permently to disk safely: {}",
-            e
+        Ok(_) => helper::print_message(PRINTSTATUS::SUCCESS, format!("Master password updated.")),
+        Err(e) => helper::print_message(
+            PRINTSTATUS::ERROR,
+            format!("Failed to write updates permently to disk safely: {}", e),
         ),
     }
 }
@@ -163,7 +194,7 @@ pub fn run_interactive(conn: &Connection, master_password: &str) {
         options.extend(keys.clone());
         options.push("[Exit]".to_string());
 
-        println!("\n--- Interactive Mode ---");
+        helper::print_message(PRINTSTATUS::INFO, format!("\n--- Interactive Mode ---"));
         let selection = match FuzzySelect::with_theme(&theme)
             .with_prompt("Type to filter options.")
             .items(&options)
@@ -205,7 +236,10 @@ pub fn run_read(conn: &Connection, key: Option<String>, master_password: &str, c
     let mut select = match conn.prepare("SELECT nonce, encrypted_value FROM store WHERE key = ?") {
         Ok(s) => s,
         Err(e) => {
-            println!("[Error]: Database system failure: {e}");
+            helper::print_message(
+                PRINTSTATUS::ERROR,
+                format!("Database system failure: {}", e),
+            );
             return;
         }
     };
@@ -221,12 +255,21 @@ pub fn run_read(conn: &Connection, key: Option<String>, master_password: &str, c
                     if copy {
                         helper::copy_to_clipboard(&decrypted);
                     } else {
-                        println!("{key}: {decrypted}");
+                        helper::print_message(
+                            PRINTSTATUS::SUCCESS,
+                            format!("{}: {}", key, decrypted),
+                        );
                     }
                 }
-                None => println!("[Error]: Decryption failed. Corrupted block or cipher mismatch."),
+                None => helper::print_message(
+                    PRINTSTATUS::ERROR,
+                    format!("Decryption failed. Corrupted block or cipher mismatch."),
+                ),
             }
         }
-        Err(_) => println!("[Error]: Key '{key}' not found in database."),
+        Err(_) => helper::print_message(
+            PRINTSTATUS::ERROR,
+            format!("Key '{}' not found in database.", key),
+        ),
     }
 }

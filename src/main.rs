@@ -6,7 +6,7 @@ use std::io::Result;
 mod commands;
 mod helper;
 mod structs;
-use structs::{Cli, Commands};
+use structs::{Cli, Commands, PRINTSTATUS};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -14,7 +14,10 @@ fn main() -> Result<()> {
     let conn = match Connection::open(db_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Error: Failed to open SQLite database: {e}");
+            helper::print_message(
+                PRINTSTATUS::ERROR,
+                format!("Error: Failed to open SQLite database: {}", e),
+            );
             std::process::exit(1);
         }
     };
@@ -27,7 +30,10 @@ fn main() -> Result<()> {
         )",
         [],
     ) {
-        eprintln!("Error: Failed to initialize config table: {e}");
+        helper::print_message(
+            PRINTSTATUS::ERROR,
+            format!("Error: Failed to initialize config table: {}", e),
+        );
         std::process::exit(1);
     }
 
@@ -40,7 +46,10 @@ fn main() -> Result<()> {
         )",
         [],
     ) {
-        eprintln!("Error: Failed to initialize data table: {e}");
+        helper::print_message(
+            PRINTSTATUS::ERROR,
+            format!("Failed to initialize data table: {}", e),
+        );
         std::process::exit(1);
     }
 

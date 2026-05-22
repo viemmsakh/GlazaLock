@@ -7,11 +7,15 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use clipboard::{ClipboardContext, ClipboardProvider};
+use colored::*;
 use dialoguer::{Confirm, FuzzySelect, Input, Password, theme::ColorfulTheme};
 use homedir::my_home;
 use rand::{Rng, RngExt};
 use rusqlite::{Connection, params};
 use std::{io::Result, path::PathBuf};
+
+// Import Custom
+use crate::structs::PRINTSTATUS;
 
 fn capitalize_first(word: &str) -> String {
     let mut chars = word.chars();
@@ -21,18 +25,32 @@ fn capitalize_first(word: &str) -> String {
     }
 }
 
+pub fn clear_screen() {
+    let clear = clearscreen::clear();
+    match clear {
+        Ok(()) => {}
+        Err(e) => print_message(PRINTSTATUS::WARN, format!("Unable to clear screen: {}", e)),
+    }
+}
+
 pub fn copy_to_clipboard(value: &str) {
     let mut ctx: ClipboardContext = match ClipboardProvider::new() {
         Ok(c) => c,
         Err(e) => {
-            println!("[Error]: Failed to access clipboard: {e}");
+            print_message(
+                PRINTSTATUS::ERROR,
+                format!("Failed to access clipboard: {}", e),
+            );
             return;
         }
     };
     if let Err(e) = ctx.set_contents(value.to_owned()) {
-        println!("[Error]: Failed to copy to clipboard: {e}");
+        print_message(
+            PRINTSTATUS::ERROR,
+            format!("Failed to copy to clipboard: {}", e),
+        );
     } else {
-        println!("[Success]: Copied to clipboard.");
+        print_message(PRINTSTATUS::SUCCESS, format!("Copied to clipboard."));
     }
 }
 
@@ -51,15 +69,18 @@ pub fn create_key_prompt(conn: &Connection, master_password: &str) {
     let exists: bool = match conn.query_row(sql_check, params![key], |row| row.get(0)) {
         Ok(found) => found,
         Err(_) => {
-            println!("[Error]: Failed to query database for key existence.");
+            print_message(
+                PRINTSTATUS::ERROR,
+                format!("Failed to query database for key existence."),
+            );
             return;
         }
     };
 
     if exists {
-        println!(
-            "[Warning]: Key '{}' already exists. Creation cancelled.",
-            key
+        print_message(
+            PRINTSTATUS::WARN,
+            format!("Key '{}' already exists. Creation cancelled.", key),
         );
         return;
     }
@@ -81,23 +102,32 @@ pub fn create_key_prompt(conn: &Connection, master_password: &str) {
     };
 
     if value != confirm_value {
-        println!("[Warning]: Passwords do not match. Key creation cancelled.");
+        print_message(
+            PRINTSTATUS::WARN,
+            format!("Passwords do not match. Key creation cancelled."),
+        );
         return;
     }
 
     let (nonce, encrypted) = match encrypt(&key, &value, master_password) {
         Some(pair) => pair,
         None => {
-            println!("[Error]: Encryption runtime failed.");
+            print_message(PRINTSTATUS::ERROR, format!("Encryption runtime failed."));
             return;
         }
     };
     let sql = "INSERT INTO store (key, nonce, encrypted_value) VALUES (?1, ?2, ?3)";
     match conn.execute(sql, params![key, nonce, encrypted]) {
-        Ok(_) => println!("[Success]: Successfully saved '{}'.", key),
-        Err(_) => println!(
-            "[Error]: Key '{}' already exists or database disk write failed.",
-            key
+        Ok(_) => print_message(
+            PRINTSTATUS::SUCCESS,
+            format!("Successfully saved '{}'.", key),
+        ),
+        Err(_) => print_message(
+            PRINTSTATUS::ERROR,
+            format!(
+                "Key '{}' already exists or database disk write failed.",
+                key
+            ),
         ),
     };
 }
@@ -121,9 +151,9 @@ fn derive_key(key: &str, password: &str) -> Option<[u8; 32]> {
     let salt = match salt {
         Ok(s) => s,
         Err(e) => {
-            println!(
-                "[Error]: Failed to create salt string from key '{}': {}",
-                key, e
+            print_message(
+                PRINTSTATUS::ERROR,
+                format!("Failed to create salt string from key '{}': {}", key, e,),
             );
             return None;
         }
@@ -133,7 +163,10 @@ fn derive_key(key: &str, password: &str) -> Option<[u8; 32]> {
     let password_hash = match password_hash {
         Ok(h) => h,
         Err(e) => {
-            println!("[Error]: Failed to hash password for key '{}': {}", key, e);
+            print_message(
+                PRINTSTATUS::ERROR,
+                format!("Failed to hash password for key '{}': {}", key, e),
+            );
             return None;
         }
     };
@@ -141,7 +174,10 @@ fn derive_key(key: &str, password: &str) -> Option<[u8; 32]> {
     let hash = password_hash.hash?;
     let hash_bytes = hash.as_bytes();
     if hash_bytes.len() < 32 {
-        println!("[Error]: Derived key hash is too short.");
+        print_message(
+            PRINTSTATUS::ERROR,
+            format!("Derived key hash is too short."),
+        );
         return None;
     }
     key_bytes.copy_from_slice(&hash_bytes[..32]);
@@ -323,7 +359,10 @@ pub fn get_home_dir() -> Result<PathBuf> {
             }
         },
         Err(e) => {
-            eprintln!("ERROR: Could not get home directory: {}", e);
+            print_message(
+                PRINTSTATUS::ERROR,
+                format!("Could not get home directory: {}", e),
+            );
             std::process::exit(1);
         }
     };
@@ -354,7 +393,7 @@ pub fn handle_authentication(conn: &Connection) -> Option<String> {
     let argon2 = Argon2::default();
     match stored_hash_res {
         Ok(stored_hash) => {
-            println!("--- Secure Authentication ---");
+            print_message(PRINTSTATUS::INFO, format!("--- Secure Authentication ---"));
             let password = Password::with_theme(&theme)
                 .with_prompt("Enter Master Password to unlock")
                 .interact()
@@ -367,7 +406,10 @@ pub fn handle_authentication(conn: &Connection) -> Option<String> {
             {
                 Some(password)
             } else {
-                eprintln!("[Error]: Invalid master password. Access denied.");
+                print_message(
+                    PRINTSTATUS::ERROR,
+                    format!("Invalid master password. Access denied."),
+                );
                 None
             }
         }
@@ -378,14 +420,23 @@ pub fn handle_authentication(conn: &Connection) -> Option<String> {
                 Err(_) => 0,
             };
             if store_count > 0 {
-                eprintln!("[SECURITY ALERT]: Critical Integrity Violation Detected!");
-                eprintln!(
-                    "Authentication has been locked down to protect data integrity. Operation aborted."
+                print_message(
+                    PRINTSTATUS::ERROR,
+                    format!("Critical Integrity Violation Detected!"),
+                );
+                print_message(
+                    PRINTSTATUS::ERROR,
+                    format!(
+                        "Authentication has been locked down to protect data integrity. Operation aborted."
+                    ),
                 );
                 return None;
             }
-            println!("--- Master Password Setup ---");
-            println!("No master password detected. Please configure one now.");
+            print_message(PRINTSTATUS::INFO, format!("--- Master Password Setup ---"));
+            print_message(
+                PRINTSTATUS::SUCCESS,
+                format!("No master password detected. Please configure one now."),
+            );
 
             let password = Password::with_theme(&theme)
                 .with_prompt("Create Master Password")
@@ -398,7 +449,10 @@ pub fn handle_authentication(conn: &Connection) -> Option<String> {
                 .ok()?;
 
             if password != confirm_password {
-                eprintln!("[Error]: Passwords do not match. Restart application to retry.");
+                print_message(
+                    PRINTSTATUS::ERROR,
+                    format!("Passwords do not match. Restart application to retry."),
+                );
                 return None;
             }
 
@@ -418,11 +472,17 @@ pub fn handle_authentication(conn: &Connection) -> Option<String> {
                 )
                 .is_err()
             {
-                eprintln!("Error: Critical failure saving master signature.");
+                print_message(
+                    PRINTSTATUS::ERROR,
+                    format!("Critical failure saving master signature."),
+                );
                 return None;
             }
 
-            println!("Master Password set successfully! Database unlocked.");
+            print_message(
+                PRINTSTATUS::SUCCESS,
+                format!("Master Password set successfully! Database unlocked."),
+            );
             Some(password)
         }
     }
@@ -449,7 +509,10 @@ pub fn manage_existing_key(conn: &Connection, key: &str, master_password: &str) 
             let mut select = match conn.prepare(sql) {
                 Ok(s) => s,
                 Err(e) => {
-                    println!("[Error]: Database system failure: {e}");
+                    print_message(
+                        PRINTSTATUS::ERROR,
+                        format!("Database system failure: {}", e),
+                    );
                     return;
                 }
             };
@@ -457,45 +520,70 @@ pub fn manage_existing_key(conn: &Connection, key: &str, master_password: &str) 
             let result = select.query_row(params![key], |row| {
                 Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
             });
-
+            clear_screen();
             match result {
                 Ok((nonce, encrypted)) => {
                     if let Some(decrypted) = decrypt(key, &encrypted, &nonce, master_password) {
-                        println!("{key}: {}", decrypted);
+                        print_message(PRINTSTATUS::SUCCESS, format!("{key}: {}", decrypted));
                     } else {
-                        println!(
-                            "[Error]: Decryption failed. Possible causes: Incorrect master password or data corruption."
+                        print_message(
+                            PRINTSTATUS::ERROR,
+                            format!(
+                                "Decryption failed. Possible causes: Incorrect master password or data corruption."
+                            ),
                         );
                     }
                 }
-                Err(e) => println!("[Error]: Failed to retrieve key data: {e}"),
+                Err(e) => print_message(
+                    PRINTSTATUS::ERROR,
+                    format!("Failed to retrieve key data: {}", e),
+                ),
             }
-            std::process::exit(0);
         }
         1 => {
             // Edit
-            let new_value: String = match Input::with_theme(&theme)
-                .with_prompt("Enter new value")
-                .interact_text()
+            let new_value: String = match Password::with_theme(&theme)
+                .with_prompt("Enter Password")
+                .interact()
             {
                 Ok(v) => v,
                 Err(_) => return,
             };
+
+            let confirm_value: String = match Password::with_theme(&theme)
+                .with_prompt("Confirm Password")
+                .interact()
+            {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+
+            if new_value != confirm_value {
+                print_message(
+                    PRINTSTATUS::WARN,
+                    format!("[Warning]: Passwords do not match. Key update cancelled."),
+                );
+                return;
+            }
+
             let (nonce, encrypted) = match encrypt(key, &new_value, master_password) {
                 Some(pair) => pair,
                 None => {
-                    println!("[Error]: Key derivation failed.");
+                    print_message(PRINTSTATUS::ERROR, format!("Key derivation failed."));
                     return;
                 }
             };
 
             let sql = "UPDATE store SET nonce = ?1, encrypted_value = ?2 WHERE key = ?3";
+            clear_screen();
             if let Err(e) = conn.execute(sql, params![nonce, encrypted, key]) {
-                println!("[Error]: Could not update the entry: {e}");
+                print_message(
+                    PRINTSTATUS::ERROR,
+                    format!("Could not update the entry: {}", e),
+                );
             } else {
-                println!("[Success]: Updated '{key}'.");
+                print_message(PRINTSTATUS::SUCCESS, format!("Updated '{key}'."));
             }
-            std::process::exit(0);
         }
         2 => {
             // Copy
@@ -503,7 +591,10 @@ pub fn manage_existing_key(conn: &Connection, key: &str, master_password: &str) 
             let mut select = match conn.prepare(sql) {
                 Ok(s) => s,
                 Err(e) => {
-                    println!("[Error]: Database system failure: {e}");
+                    print_message(
+                        PRINTSTATUS::ERROR,
+                        format!("Database system failure: {}", e),
+                    );
                     return;
                 }
             };
@@ -511,20 +602,25 @@ pub fn manage_existing_key(conn: &Connection, key: &str, master_password: &str) 
             let result = select.query_row(params![key], |row| {
                 Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
             });
-
+            clear_screen();
             match result {
                 Ok((nonce, encrypted)) => {
                     if let Some(decrypted) = decrypt(key, &encrypted, &nonce, master_password) {
                         copy_to_clipboard(&decrypted);
                     } else {
-                        println!(
-                            "[Error]: Decryption failed. Possible causes: Incorrect master password or data corruption."
+                        print_message(
+                            PRINTSTATUS::ERROR,
+                            format!(
+                                "Decryption failed. Possible causes: Incorrect master password or data corruption."
+                            ),
                         );
                     }
                 }
-                Err(e) => println!("[Error]: Failed to retrieve key data: {e}"),
+                Err(e) => print_message(
+                    PRINTSTATUS::ERROR,
+                    format!("Failed to retrieve key data: {}", e),
+                ),
             }
-            std::process::exit(0);
         }
         3 => {
             // Delete
@@ -539,14 +635,31 @@ pub fn manage_existing_key(conn: &Connection, key: &str, master_password: &str) 
 
             if confirm {
                 let sql = "DELETE FROM store WHERE key = ?1";
+                clear_screen();
                 if let Err(e) = conn.execute(sql, params![key]) {
-                    println!("[Error]: Failed to delete row: {e}");
+                    print_message(PRINTSTATUS::ERROR, format!("Failed to delete row: {}", e));
                 } else {
-                    println!("[Success]: Deleted '{key}'.");
+                    print_message(PRINTSTATUS::SUCCESS, format!("Deleted '{}'.", key));
                 }
             }
-            std::process::exit(0);
         }
         _ => {}
+    }
+}
+
+pub fn print_message(status: PRINTSTATUS, msg: String) {
+    match status {
+        PRINTSTATUS::ERROR => {
+            eprintln!("{}", format!("[ERROR]: {}", msg).red());
+        }
+        PRINTSTATUS::WARN => {
+            println!("{}", format!("[WARN]: {}", msg).yellow());
+        }
+        PRINTSTATUS::SUCCESS => {
+            println!("{}", format!("[SUCCESS]: {}", msg).green());
+        }
+        PRINTSTATUS::INFO => {
+            println!("{}", format!("{}", msg).cyan());
+        }
     }
 }

@@ -53,3 +53,11 @@ pub enum Commands {
     /// Reset master password, must know existing master password.
     Reset,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PRINTSTATUS {
+    SUCCESS,
+    WARN,
+    ERROR,
+    INFO,
+}
