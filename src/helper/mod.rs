@@ -6,16 +6,18 @@ use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
+use base64ct::{Base64, Encoding};
 use clipboard::{ClipboardContext, ClipboardProvider};
 use colored::*;
 use dialoguer::{Confirm, FuzzySelect, Input, Password, theme::ColorfulTheme};
 use homedir::my_home;
 use rand::{Rng, RngExt};
-use rusqlite::{Connection, params};
-use std::{io::Result, path::PathBuf};
+use std::fs::{File, read_dir, read_to_string, remove_file, write};
+use std::io::{Read, Result};
+use std::path::PathBuf;
 
-// Import Custom
-use crate::structs::PRINTSTATUS;
+// Import Custom Flat-File Structs and Status Enums
+use crate::structs::{AppConfig, EncryptedRecord, PRINTSTATUS};
 
 fn capitalize_first(word: &str) -> String {
     let mut chars = word.chars();
@@ -54,30 +56,23 @@ pub fn copy_to_clipboard(value: &str) {
     }
 }
 
-pub fn create_key_prompt(conn: &Connection, master_password: &str) {
+pub fn create_key_prompt(master_password: &str) {
     let theme = ColorfulTheme::default();
-    let key: String = match Input::with_theme(&theme)
+    let key: String = match Input::<String>::with_theme(&theme)
         .with_prompt("Enter a new key name")
         .interact_text()
     {
-        Ok(k) => k,
+        Ok(k) => k.trim().to_string(),
         Err(_) => return,
     };
-    key.trim().to_string();
 
-    let sql_check = "SELECT EXISTS(SELECT 1 FROM store WHERE key = ?1)";
-    let exists: bool = match conn.query_row(sql_check, params![key], |row| row.get(0)) {
-        Ok(found) => found,
-        Err(_) => {
-            print_message(
-                PRINTSTATUS::ERROR,
-                format!("Failed to query database for key existence."),
-            );
-            return;
-        }
+    let mut key_file_path = match get_keys_dir() {
+        Ok(p) => p,
+        Err(_) => return,
     };
+    key_file_path.push(&key);
 
-    if exists {
+    if key_file_path.exists() {
         print_message(
             PRINTSTATUS::WARN,
             format!("Key '{}' already exists. Creation cancelled.", key),
@@ -109,27 +104,30 @@ pub fn create_key_prompt(conn: &Connection, master_password: &str) {
         return;
     }
 
-    let (nonce, encrypted) = match encrypt(&key, &value, master_password) {
+    let (nonce_bytes, encrypted_bytes) = match encrypt(&key, &value, master_password) {
         Some(pair) => pair,
         None => {
             print_message(PRINTSTATUS::ERROR, format!("Encryption runtime failed."));
             return;
         }
     };
-    let sql = "INSERT INTO store (key, nonce, encrypted_value) VALUES (?1, ?2, ?3)";
-    match conn.execute(sql, params![key, nonce, encrypted]) {
-        Ok(_) => print_message(
-            PRINTSTATUS::SUCCESS,
-            format!("Successfully saved '{}'.", key),
-        ),
-        Err(_) => print_message(
-            PRINTSTATUS::ERROR,
-            format!(
-                "Key '{}' already exists or database disk write failed.",
-                key
-            ),
-        ),
+
+    // Serialize binary byte blocks into secure, standard readable Base64 Strings
+    let record = EncryptedRecord {
+        nonce: Base64::encode_string(&nonce_bytes),
+        encrypted_value: Base64::encode_string(&encrypted_bytes),
     };
+
+    if let Ok(serialized) = serde_json::to_string_pretty(&record) {
+        if write(key_file_path, serialized).is_ok() {
+            print_message(
+                PRINTSTATUS::SUCCESS,
+                format!("Successfully saved '{}'.", key),
+            );
+            return;
+        }
+    }
+    print_message(PRINTSTATUS::ERROR, format!("Flat-file write failed."));
 }
 
 pub fn decrypt(
@@ -206,7 +204,7 @@ pub fn generate_secure_password(
     }
 
     if base_charset.is_empty() {
-        base_charset.push_str("abcdefghijklmnopqrstuvwxyz"); // Default to lowercase if no options selected
+        base_charset.push_str("abcdefghijklmnopqrstuvwxyz");
     }
     let mut full_charset = base_charset.clone();
     if symbols {
@@ -272,7 +270,7 @@ pub fn generate_word_passphrase(
             let random_garbage =
                 generate_secure_password(remaining_length, uppercase, numbers, symbols);
             chosen_words.push(random_garbage);
-            break; // Garbage fills the last of the length, so we are done
+            break;
         }
 
         let mut target_word_len = rng.random_range(4..=6);
@@ -326,28 +324,39 @@ pub fn generate_word_passphrase(
     passphrase
 }
 
-pub fn get_all_keys(conn: &Connection) -> Vec<String> {
-    let sql = "SELECT key FROM store";
-    let mut select = match conn.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-
-    let key_iterator = match select.query_map([], |row| row.get::<_, String>(0)) {
-        Ok(iterator) => iterator,
-        Err(_) => return Vec::new(),
-    };
-
-    key_iterator
-        .filter_map(|key| key.ok())
-        .map(|key_str| format!("\t{}", key_str))
-        .collect()
+pub fn get_glock_dir() -> Result<PathBuf> {
+    let mut path = get_home_dir()?;
+    path.push(".glock");
+    Ok(path)
 }
 
-pub fn get_db_path() -> Result<PathBuf> {
-    let mut db_path = get_home_dir()?;
-    db_path.push(".gl.db");
-    Ok(db_path)
+pub fn get_keys_dir() -> Result<PathBuf> {
+    let mut path = get_glock_dir()?;
+    path.push("keys");
+    Ok(path)
+}
+
+pub fn get_config_path() -> Result<PathBuf> {
+    let mut path = get_glock_dir()?;
+    path.push("config.json");
+    Ok(path)
+}
+
+pub fn get_all_keys() -> Vec<String> {
+    let keys_dir = match get_keys_dir() {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    if let Ok(entries) = read_dir(keys_dir) {
+        entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .map(|name| format!("\t{}", name))
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn get_home_dir() -> Result<PathBuf> {
@@ -384,111 +393,106 @@ pub fn get_random_word_with_length(target_length: usize) -> Option<&'static str>
     Some(word_pool[idx])
 }
 
-pub fn handle_authentication(conn: &Connection) -> Option<String> {
+pub fn handle_authentication() -> Option<String> {
     let theme = ColorfulTheme::default();
-    let sql = "SELECT password_hash FROM config WHERE id = 1";
-    let mut select = conn.prepare(sql).ok()?;
-    let stored_hash_res = select.query_row([], |row| row.get::<_, String>(0));
-
+    let config_path = get_config_path().ok()?;
     let argon2 = Argon2::default();
-    match stored_hash_res {
-        Ok(stored_hash) => {
-            print_message(PRINTSTATUS::INFO, format!("--- Secure Authentication ---"));
-            let password = Password::with_theme(&theme)
-                .with_prompt("Enter Master Password to unlock")
-                .interact()
-                .ok()?;
 
-            let parsed_hash = PasswordHash::new(&stored_hash.as_str()).ok()?;
-            if argon2
-                .verify_password(password.as_bytes(), &parsed_hash)
-                .is_ok()
-            {
-                Some(password)
-            } else {
-                print_message(
-                    PRINTSTATUS::ERROR,
-                    format!("Invalid master password. Access denied."),
-                );
-                None
-            }
-        }
-        Err(_) => {
-            let count_sql = "SELECT COUNT(*) from store";
-            let store_count: i64 = match conn.query_row(count_sql, [], |row| row.get(0)) {
-                Ok(count) => count,
-                Err(_) => 0,
-            };
-            if store_count > 0 {
-                print_message(
-                    PRINTSTATUS::ERROR,
-                    format!("Critical Integrity Violation Detected!"),
-                );
-                print_message(
-                    PRINTSTATUS::ERROR,
-                    format!(
-                        "Authentication has been locked down to protect data integrity. Operation aborted."
-                    ),
-                );
-                return None;
-            }
-            print_message(PRINTSTATUS::INFO, format!("--- Master Password Setup ---"));
-            print_message(
-                PRINTSTATUS::SUCCESS,
-                format!("No master password detected. Please configure one now."),
-            );
+    if config_path.exists() {
+        let mut file = File::open(&config_path).ok()?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).ok()?;
+        let config: AppConfig = serde_json::from_str(&contents).ok()?;
 
-            let password = Password::with_theme(&theme)
-                .with_prompt("Create Master Password")
-                .interact()
-                .ok()?;
+        print_message(PRINTSTATUS::INFO, format!("--- Secure Authentication ---"));
+        let password = Password::with_theme(&theme)
+            .with_prompt("Enter Master Password to unlock")
+            .interact()
+            .ok()?;
 
-            let confirm_password = Password::with_theme(&theme)
-                .with_prompt("Confirm Master Password")
-                .interact()
-                .ok()?;
-
-            if password != confirm_password {
-                print_message(
-                    PRINTSTATUS::ERROR,
-                    format!("Passwords do not match. Restart application to retry."),
-                );
-                return None;
-            }
-
-            let mut salt_bytes = [0u8; 16];
-            rand::rng().fill_bytes(&mut salt_bytes);
-            let salt = SaltString::encode_b64(&salt_bytes).ok()?;
-
-            let password_hash = argon2
-                .hash_password(password.as_bytes(), &salt)
-                .ok()?
-                .to_string();
-
-            if conn
-                .execute(
-                    "INSERT INTO config (id, password_hash) VALUES (1, ?1)",
-                    params![password_hash],
-                )
-                .is_err()
-            {
-                print_message(
-                    PRINTSTATUS::ERROR,
-                    format!("Critical failure saving master signature."),
-                );
-                return None;
-            }
-
-            print_message(
-                PRINTSTATUS::SUCCESS,
-                format!("Master Password set successfully! Database unlocked."),
-            );
+        let parsed_hash = PasswordHash::new(&config.password_hash).ok()?;
+        if argon2
+            .verify_password(password.as_bytes(), &parsed_hash)
+            .is_ok()
+        {
             Some(password)
+        } else {
+            print_message(
+                PRINTSTATUS::ERROR,
+                format!("Invalid master password. Access denied."),
+            );
+            None
         }
+    } else {
+        let keys_dir = get_keys_dir().ok()?;
+        let store_count = read_dir(keys_dir).map(|d| d.count()).unwrap_or(0);
+
+        if store_count > 0 {
+            print_message(
+                PRINTSTATUS::ERROR,
+                format!("Critical Integrity Violation Detected!"),
+            );
+            print_message(
+                PRINTSTATUS::ERROR,
+                format!(
+                    "Authentication has been locked down to protect data integrity. Operation aborted."
+                ),
+            );
+            return None;
+        }
+        print_message(PRINTSTATUS::INFO, format!("--- Master Password Setup ---"));
+        print_message(
+            PRINTSTATUS::SUCCESS,
+            format!("No master password detected. Please configure one now."),
+        );
+
+        let password = Password::with_theme(&theme)
+            .with_prompt("Create Master Password")
+            .interact()
+            .ok()?;
+
+        let confirm_password = Password::with_theme(&theme)
+            .with_prompt("Confirm Master Password")
+            .interact()
+            .ok()?;
+
+        if password != confirm_password {
+            print_message(
+                PRINTSTATUS::ERROR,
+                format!("Passwords do not match. Restart application to retry."),
+            );
+            return None;
+        }
+
+        let mut salt_bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut salt_bytes);
+        let salt = SaltString::encode_b64(&salt_bytes).ok()?;
+
+        let password_hash = argon2
+            .hash_password(password.as_bytes(), &salt)
+            .ok()?
+            .to_string();
+
+        let new_config = AppConfig { password_hash };
+        if let Ok(serialized) = serde_json::to_string_pretty(&new_config) {
+            if write(config_path, serialized).is_ok() {
+                print_message(
+                    PRINTSTATUS::SUCCESS,
+                    format!("Master Password set successfully! Database unlocked."),
+                );
+                return Some(password);
+            }
+        }
+
+        print_message(
+            PRINTSTATUS::ERROR,
+            format!("Critical failure saving master signature."),
+        );
+        None
     }
 }
 
-pub fn manage_existing_key(conn: &Connection, key: &str, master_password: &str) {
+pub fn manage_existing_key(key: &str, master_password: &str) {
     let theme = ColorfulTheme::default();
     let actions = vec!["View", "Edit", "Copy", "Delete", "Back"];
 
@@ -502,43 +506,35 @@ pub fn manage_existing_key(conn: &Connection, key: &str, master_password: &str) 
         _ => return,
     };
 
+    let mut key_file_path = match get_keys_dir() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    key_file_path.push(key);
+
     match selection {
         0 => {
             // View
-            let sql = "SELECT nonce, encrypted_value FROM store WHERE key = ?1";
-            let mut select = match conn.prepare(sql) {
-                Ok(s) => s,
-                Err(e) => {
-                    print_message(
-                        PRINTSTATUS::ERROR,
-                        format!("Database system failure: {}", e),
-                    );
-                    return;
-                }
-            };
-
-            let result = select.query_row(params![key], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            });
             clear_screen();
-            match result {
-                Ok((nonce, encrypted)) => {
-                    if let Some(decrypted) = decrypt(key, &encrypted, &nonce, master_password) {
-                        print_message(PRINTSTATUS::SUCCESS, format!("{key}: {}", decrypted));
-                    } else {
-                        print_message(
-                            PRINTSTATUS::ERROR,
-                            format!(
-                                "Decryption failed. Possible causes: Incorrect master password or data corruption."
-                            ),
-                        );
+            if let Ok(contents) = read_to_string(&key_file_path) {
+                if let Ok(record) = serde_json::from_str::<EncryptedRecord>(&contents) {
+                    let nonce_bytes = Base64::decode_vec(&record.nonce).ok();
+                    let encrypted_bytes = Base64::decode_vec(&record.encrypted_value).ok();
+
+                    if let (Some(n_bytes), Some(e_bytes)) = (nonce_bytes, encrypted_bytes) {
+                        if let Some(decrypted) = decrypt(key, &e_bytes, &n_bytes, master_password) {
+                            print_message(PRINTSTATUS::SUCCESS, format!("{key}: {}", decrypted));
+                            return;
+                        }
                     }
                 }
-                Err(e) => print_message(
-                    PRINTSTATUS::ERROR,
-                    format!("Failed to retrieve key data: {}", e),
-                ),
             }
+            print_message(
+                PRINTSTATUS::ERROR,
+                format!(
+                    "Decryption failed. Possible causes: Incorrect master password or data corruption."
+                ),
+            );
         }
         1 => {
             // Edit
@@ -566,7 +562,7 @@ pub fn manage_existing_key(conn: &Connection, key: &str, master_password: &str) 
                 return;
             }
 
-            let (nonce, encrypted) = match encrypt(key, &new_value, master_password) {
+            let (nonce_bytes, encrypted_bytes) = match encrypt(key, &new_value, master_password) {
                 Some(pair) => pair,
                 None => {
                     print_message(PRINTSTATUS::ERROR, format!("Key derivation failed."));
@@ -574,53 +570,42 @@ pub fn manage_existing_key(conn: &Connection, key: &str, master_password: &str) 
                 }
             };
 
-            let sql = "UPDATE store SET nonce = ?1, encrypted_value = ?2 WHERE key = ?3";
+            let record = EncryptedRecord {
+                nonce: Base64::encode_string(&nonce_bytes),
+                encrypted_value: Base64::encode_string(&encrypted_bytes),
+            };
+
             clear_screen();
-            if let Err(e) = conn.execute(sql, params![nonce, encrypted, key]) {
-                print_message(
-                    PRINTSTATUS::ERROR,
-                    format!("Could not update the entry: {}", e),
-                );
-            } else {
-                print_message(PRINTSTATUS::SUCCESS, format!("Updated '{key}'."));
+            if let Ok(serialized) = serde_json::to_string_pretty(&record) {
+                if write(key_file_path, serialized).is_ok() {
+                    print_message(PRINTSTATUS::SUCCESS, format!("Updated '{key}'."));
+                    return;
+                }
             }
+            print_message(PRINTSTATUS::ERROR, format!("Could not update the entry."));
         }
         2 => {
             // Copy
-            let sql = "SELECT nonce, encrypted_value FROM store WHERE key = ?1";
-            let mut select = match conn.prepare(sql) {
-                Ok(s) => s,
-                Err(e) => {
-                    print_message(
-                        PRINTSTATUS::ERROR,
-                        format!("Database system failure: {}", e),
-                    );
-                    return;
-                }
-            };
-
-            let result = select.query_row(params![key], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            });
             clear_screen();
-            match result {
-                Ok((nonce, encrypted)) => {
-                    if let Some(decrypted) = decrypt(key, &encrypted, &nonce, master_password) {
-                        copy_to_clipboard(&decrypted);
-                    } else {
-                        print_message(
-                            PRINTSTATUS::ERROR,
-                            format!(
-                                "Decryption failed. Possible causes: Incorrect master password or data corruption."
-                            ),
-                        );
+            if let Ok(contents) = read_to_string(&key_file_path) {
+                if let Ok(record) = serde_json::from_str::<EncryptedRecord>(&contents) {
+                    let nonce_bytes = Base64::decode_vec(&record.nonce).ok();
+                    let encrypted_bytes = Base64::decode_vec(&record.encrypted_value).ok();
+
+                    if let (Some(n_bytes), Some(e_bytes)) = (nonce_bytes, encrypted_bytes) {
+                        if let Some(decrypted) = decrypt(key, &e_bytes, &n_bytes, master_password) {
+                            copy_to_clipboard(&decrypted);
+                            return;
+                        }
                     }
                 }
-                Err(e) => print_message(
-                    PRINTSTATUS::ERROR,
-                    format!("Failed to retrieve key data: {}", e),
-                ),
             }
+            print_message(
+                PRINTSTATUS::ERROR,
+                format!(
+                    "Decryption failed. Possible causes: Incorrect master password or data corruption."
+                ),
+            );
         }
         3 => {
             // Delete
@@ -634,12 +619,11 @@ pub fn manage_existing_key(conn: &Connection, key: &str, master_password: &str) 
             };
 
             if confirm {
-                let sql = "DELETE FROM store WHERE key = ?1";
                 clear_screen();
-                if let Err(e) = conn.execute(sql, params![key]) {
-                    print_message(PRINTSTATUS::ERROR, format!("Failed to delete row: {}", e));
-                } else {
+                if remove_file(key_file_path).is_ok() {
                     print_message(PRINTSTATUS::SUCCESS, format!("Deleted '{}'.", key));
+                } else {
+                    print_message(PRINTSTATUS::ERROR, format!("Failed to delete entry file."));
                 }
             }
         }

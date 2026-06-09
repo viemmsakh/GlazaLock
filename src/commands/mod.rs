@@ -2,13 +2,14 @@ use argon2::{
     Argon2,
     password_hash::{PasswordHasher, SaltString},
 };
+use base64ct::{Base64, Encoding};
 use dialoguer::{FuzzySelect, Input, Password, theme::ColorfulTheme};
 use rand::Rng;
-use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use std::fs::{read_dir, read_to_string, write};
 
-// Import Custom Modules
+// Import Custom Modules and Enums
 use crate::helper;
-use crate::structs::PRINTSTATUS;
+use crate::structs::{AppConfig, EncryptedRecord, PRINTSTATUS};
 
 pub fn generate_password(
     length: usize,
@@ -37,10 +38,11 @@ pub fn generate_password(
     }
 }
 
-pub fn reset_master_password(conn: &Connection, master_password: &str) {
+pub fn reset_master_password(master_password: &str) {
     let theme = ColorfulTheme::default();
     let argon2 = Argon2::default();
     helper::print_message(PRINTSTATUS::INFO, format!("--- Reset Master Password ---"));
+
     let new_master_password = match Password::with_theme(&theme)
         .with_prompt("Enter NEW Master Password")
         .interact()
@@ -77,85 +79,88 @@ pub fn reset_master_password(conn: &Connection, master_password: &str) {
         format!("Re-encrypting database vault secrets... Do not close the application."),
     );
 
-    let tx = match Transaction::new_unchecked(conn, TransactionBehavior::Deferred) {
-        Ok(t) => t,
+    let keys_dir = match helper::get_keys_dir() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let entries = match read_dir(&keys_dir) {
+        Ok(d) => d,
         Err(e) => {
             helper::print_message(
                 PRINTSTATUS::ERROR,
-                format!("Failed to open transaction frame: {}", e),
-            );
-            return;
-        }
-    };
-    let sql = "SELECT * FROM store";
-    let mut select = match tx.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => {
-            helper::print_message(
-                PRINTSTATUS::ERROR,
-                format!("Failed to prepare data scanning operation."),
+                format!("Failed to scan the flatfile key workspace directory: {}", e),
             );
             return;
         }
     };
 
-    let rows = match select.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Vec<u8>>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-        ))
-    }) {
-        Ok(r) => r,
-        Err(_) => {
-            helper::print_message(
-                PRINTSTATUS::ERROR,
-                format!("Failed to query storage elements."),
-            );
-            return;
-        }
-    };
-    let mut migrated_entries = Vec::new();
+    // Iterate over every flatfile key entry inside ~/.glock/keys/ and migrate them one-by-one
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let key_name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
 
-    for row in rows {
-        if let Ok((key, nonce, encrypted_value)) = row {
-            let decrypted_password =
-                match helper::decrypt(&key, &encrypted_value, &nonce, master_password) {
-                    Some(decrypted) => decrypted,
-                    None => {
-                        helper::print_message(
-                            PRINTSTATUS::ERROR,
-                            format!("Decryption failed. Corrupted block or cipher mismatch."),
-                        );
-                        return;
+        if let Ok(contents) = read_to_string(&path) {
+            if let Ok(record) = serde_json::from_str::<EncryptedRecord>(&contents) {
+                // Decode from textual base64 back into raw bytes for cryptography
+                let nonce_bytes = Base64::decode_vec(&record.nonce).ok();
+                let encrypted_bytes = Base64::decode_vec(&record.encrypted_value).ok();
+
+                if let (Some(n_bytes), Some(e_bytes)) = (nonce_bytes, encrypted_bytes) {
+                    let decrypted_password = match helper::decrypt(
+                        &key_name,
+                        &e_bytes,
+                        &n_bytes,
+                        master_password,
+                    ) {
+                        Some(decrypted) => decrypted,
+                        None => {
+                            helper::print_message(
+                                PRINTSTATUS::ERROR,
+                                format!(
+                                    "Decryption failed for key '{}'. Corrupted block or cipher mismatch.",
+                                    key_name
+                                ),
+                            );
+                            return;
+                        }
+                    };
+
+                    // Re-encrypt the secret data under the newly chosen master password
+                    let (new_nonce, encrypted_password) =
+                        match helper::encrypt(&key_name, &decrypted_password, &new_master_password)
+                        {
+                            Some(pair) => pair,
+                            None => return,
+                        };
+
+                    // Serialize raw binary blocks back into safe, textual base64 JSON records
+                    let updated_record = EncryptedRecord {
+                        nonce: Base64::encode_string(&new_nonce),
+                        encrypted_value: Base64::encode_string(&encrypted_password),
+                    };
+
+                    if let Ok(serialized) = serde_json::to_string_pretty(&updated_record) {
+                        if write(&path, serialized).is_err() {
+                            helper::print_message(
+                                PRINTSTATUS::ERROR,
+                                format!(
+                                    "Failed to save re-encrypted record flatfile block for '{}'. Aborting.",
+                                    key_name
+                                ),
+                            );
+                            return;
+                        }
                     }
-                };
-            // Some((nonce_bytes.to_vec(), encrypted_value))
-            let (new_nonce, encrypted_password) =
-                match helper::encrypt(&key, &decrypted_password, &new_master_password) {
-                    Some(pair) => pair,
-                    None => {
-                        return;
-                    }
-                };
-
-            migrated_entries.push((key, new_nonce, encrypted_password));
+                }
+            }
         }
     }
-    drop(select);
-    for (key, nonce, encrypted_password) in migrated_entries {
-        let sql = "UPDATE store SET nonce = ?1, encrypted_value = ?2 WHERE key = ?3";
-        if tx
-            .execute(sql, params![nonce, encrypted_password, key])
-            .is_err()
-        {
-            helper::print_message(
-                PRINTSTATUS::ERROR,
-                format!("Failed to save re-encrypted record block. Aborting."),
-            );
-            return;
-        }
-    }
+
+    // Generate a fresh signature hash for the new system configuration master entry
     let mut salt_bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut salt_bytes);
     let salt = match SaltString::encode_b64(&salt_bytes) {
@@ -168,28 +173,29 @@ pub fn reset_master_password(conn: &Connection, master_password: &str) {
         Err(_) => return,
     };
 
-    let hash_sql = "UPDATE config SET password_hash = ?1 WHERE id = 1";
-    if tx.execute(hash_sql, params![password_hash]).is_err() {
-        helper::print_message(
-            PRINTSTATUS::ERROR,
-            format!("Failed to update system configuration keys. Aborting transaction."),
-        );
-        return;
+    if let Ok(config_path) = helper::get_config_path() {
+        let new_config = AppConfig { password_hash };
+        if let Ok(serialized) = serde_json::to_string_pretty(&new_config) {
+            if write(config_path, serialized).is_ok() {
+                helper::print_message(
+                    PRINTSTATUS::SUCCESS,
+                    format!("Master password updated successfully."),
+                );
+                return;
+            }
+        }
     }
 
-    match tx.commit() {
-        Ok(_) => helper::print_message(PRINTSTATUS::SUCCESS, format!("Master password updated.")),
-        Err(e) => helper::print_message(
-            PRINTSTATUS::ERROR,
-            format!("Failed to write updates permently to disk safely: {}", e),
-        ),
-    }
+    helper::print_message(
+        PRINTSTATUS::ERROR,
+        format!("Failed to finalize system configuration hash values cleanly to disk."),
+    );
 }
 
-pub fn run_interactive(conn: &Connection, master_password: &str) {
+pub fn run_interactive(master_password: &str) {
     let theme = ColorfulTheme::default();
     loop {
-        let keys = helper::get_all_keys(conn);
+        let keys = helper::get_all_keys();
         let mut options = vec!["[Create New Key]".to_string()];
         options.extend(keys.clone());
         options.push("[Exit]".to_string());
@@ -205,21 +211,21 @@ pub fn run_interactive(conn: &Connection, master_password: &str) {
             _ => break,
         };
         if selection == 0 {
-            // Create New Key
-            helper::create_key_prompt(conn, master_password);
+            // Create New Key Flatfile Entry
+            helper::create_key_prompt(master_password);
         } else if selection == options.len() - 1 {
             break;
         } else {
             if let Some(selected_key) = keys.get(selection - 1) {
                 let selected_key = selected_key.trim();
-                // Manage Existing Key
-                helper::manage_existing_key(conn, selected_key, master_password);
+                // Manage Existing Flatfile Key Lifecycle Actions
+                helper::manage_existing_key(selected_key, master_password);
             }
         }
     }
 }
 
-pub fn run_read(conn: &Connection, key: Option<String>, master_password: &str, copy: bool) {
+pub fn run_read(key: Option<String>, master_password: &str, copy: bool) {
     let theme = ColorfulTheme::default();
 
     let key = match key {
@@ -233,43 +239,58 @@ pub fn run_read(conn: &Connection, key: Option<String>, master_password: &str, c
         },
     };
 
-    let mut select = match conn.prepare("SELECT nonce, encrypted_value FROM store WHERE key = ?") {
-        Ok(s) => s,
-        Err(e) => {
-            helper::print_message(
-                PRINTSTATUS::ERROR,
-                format!("Database system failure: {}", e),
-            );
-            return;
-        }
+    let mut key_path = match helper::get_keys_dir() {
+        Ok(p) => p,
+        Err(_) => return,
     };
+    key_path.push(&key);
 
-    let result = select.query_row(params![key], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-    });
+    if !key_path.exists() {
+        helper::print_message(
+            PRINTSTATUS::ERROR,
+            format!(
+                "Key '{}' not found in flatfile database storage environment.",
+                key
+            ),
+        );
+        return;
+    }
 
-    match result {
-        Ok((nonce, encrypted_value)) => {
-            match helper::decrypt(&key, &encrypted_value, &nonce, master_password) {
-                Some(decrypted) => {
-                    if copy {
-                        helper::copy_to_clipboard(&decrypted);
-                    } else {
-                        helper::print_message(
-                            PRINTSTATUS::SUCCESS,
-                            format!("{}: {}", key, decrypted),
-                        );
+    if let Ok(contents) = read_to_string(key_path) {
+        if let Ok(record) = serde_json::from_str::<EncryptedRecord>(&contents) {
+            // Convert string block tokens into bytes for hardware crypto computation
+            let nonce_bytes = Base64::decode_vec(&record.nonce).ok();
+            let encrypted_bytes = Base64::decode_vec(&record.encrypted_value).ok();
+
+            if let (Some(n_bytes), Some(e_bytes)) = (nonce_bytes, encrypted_bytes) {
+                match helper::decrypt(&key, &e_bytes, &n_bytes, master_password) {
+                    Some(decrypted) => {
+                        if copy {
+                            helper::copy_to_clipboard(&decrypted);
+                        } else {
+                            helper::print_message(
+                                PRINTSTATUS::SUCCESS,
+                                format!("{}: {}", key, decrypted),
+                            );
+                        }
                     }
+                    None => helper::print_message(
+                        PRINTSTATUS::ERROR,
+                        format!(
+                            "Decryption failed. Corrupted block data or cipher initialization mismatch."
+                        ),
+                    ),
                 }
-                None => helper::print_message(
-                    PRINTSTATUS::ERROR,
-                    format!("Decryption failed. Corrupted block or cipher mismatch."),
-                ),
+                return;
             }
         }
-        Err(_) => helper::print_message(
-            PRINTSTATUS::ERROR,
-            format!("Key '{}' not found in database.", key),
-        ),
     }
+
+    helper::print_message(
+        PRINTSTATUS::ERROR,
+        format!(
+            "Failed to successfully parse the encrypted text block for key '{}'.",
+            key
+        ),
+    );
 }
