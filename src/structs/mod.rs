@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
 #[command(author, version, name = "GlazaLock", about = "A secure local key-value store for passwords.", long_about = None)]
@@ -60,4 +61,17 @@ pub enum PRINTSTATUS {
     WARN,
     ERROR,
     INFO,
+}
+
+/// Represents the global system config file (~/.glock/config.json)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AppConfig {
+    pub password_hash: String,
+}
+
+/// Represents the layout of an individual flat file key (~/.glock/keys/<name>)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EncryptedRecord {
+    pub nonce: String,
+    pub encrypted_value: String,
 }
